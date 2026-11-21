@@ -1,0 +1,20 @@
+{
+  "disclaimer": "Decision support only. Not validated for clinical use. Requires clinician review.",
+  "n_patients": 88,
+  "n_stays": 117,
+  "n_rows": 1720,
+  "n_positive_rows": 21,
+  "n_positive_stays": 18,
+  "cv_folds_by_patient": 5,
+  "alert_threshold": 0.5,
+  "auroc": 0.7202,
+  "auprc": 0.0462,
+  "brier_score": 0.1559,
+  "alert_rate_per_patient_day": 1.258,
+  "median_lead_time_hours": 29.5,
+  "small_sample_caveats": [
+    "Small-cohort prototype (n=88 patients, 117 ICU stays, 18 stays with onset). High variance expected.",
+    "Not externally validated; MIMIC-IV Demo is US tertiary-ICU data and does not represent Romanian hospital populations.",
+    "Prototype thresholds and APS III approximation require clinician verification."
+  ]
+}

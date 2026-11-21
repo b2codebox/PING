@@ -1,0 +1,13 @@
+{
+  "disclaimer": "Decision support only. Not validated for clinical use. Requires clinician review.",
+  "task": "Active / Post-Onset Sepsis Detection (Combined Cohort)",
+  "dataset": "PhysioNet 2019 (19339) + User Sepsis 6.6k (2276)",
+  "n_stays": 21615,
+  "n_sepsis_stays": 3385,
+  "n_non_sepsis_stays": 18230,
+  "cv_folds_by_patient": 3,
+  "auroc": 0.9469,
+  "auprc": 0.8609,
+  "brier_score": 0.0498,
+  "temporal_note": "Evaluates active/post-onset sepsis detection across shared vitals and labs. Kept strictly separate from the pre-onset 6-hour preventive model (t < onset) because the 6.6k sepsis cohort records hours 1..24 after sepsis onset."
+}
