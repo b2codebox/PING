@@ -14,7 +14,7 @@ validated, and not connected to any live hospital system.)
 - Streamlit dashboard with pseudonymised stays, ICU specialty filter, medication filters,
   synchronized evaluation-hour control, and EN/RO labels (clinical terms kept in English).
 
-##Datasets:
+## Datasets:
 
 - MIMIC-IV Clinical Database Demo (v2.2)
     Source: PhysioNet / Beth Israel Deaconess Medical Center (Boston, US).
