@@ -3,8 +3,8 @@
 > **Decision support only. Not validated for clinical use. Requires clinician review.**
 
 Research prototype for sepsis onset detection, organ dysfunction scoring (SOFA / APS III),
-and tiered early-warning alerts on structured ICU data. Not a medical device, not clinically
-validated, and not connected to any live hospital system.
+and tiered early-warning alerts on structured ICU data. (Not a medical device, not clinically
+validated, and not connected to any live hospital system.)
 
 ## What it does
 
