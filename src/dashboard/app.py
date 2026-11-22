@@ -10,7 +10,7 @@ Displays:
   breakdown (vulnerability, early deterioration, pre-existing vs ICU-acquired
   infection context).
 * Interactive clinician `/assess` simulator.
-* Small-cohort validation metrics & Romanian hospital integration stub checklist.
+* Validation and cross-validation metrics for the demo and full cohorts.
 """
 
 from __future__ import annotations
@@ -250,6 +250,44 @@ def inject_layout_css() -> None:
             border-radius: var(--ui-radius) !important;
         }
 
+        /* --- Model Accuracy tab: three metric blocks ---------------------
+           Each block (heading, metric row, optional caption) is its own
+           container, so the space between blocks comes from one outer
+           container gap and is the same everywhere. The caption is part of
+           the block it describes rather than a full-height separator, which
+           is what made the second gap look larger than the first.
+        */
+        .st-key-model_accuracy_tab [data-testid="stHeading"],
+        .st-key-model_accuracy_tab [data-testid="stHeading"] h2,
+        .st-key-model_accuracy_tab [data-testid="stHeading"] h3 {
+            margin: 0 !important;
+            padding: 0 !important;
+        }
+        .st-key-model_accuracy_tab [data-testid="stCaptionContainer"],
+        .st-key-model_accuracy_tab [data-testid="stCaptionContainer"] p {
+            margin: 0 !important;
+            padding: 0 !important;
+        }
+        .st-key-model_accuracy_tab [data-testid="stCaptionContainer"] p {
+            font-size: 0.8rem;
+            line-height: 1.4;
+        }
+        .st-key-model_accuracy_tab [data-testid="stMetric"],
+        .st-key-model_accuracy_tab [data-testid="stHorizontalBlock"] {
+            margin: 0 !important;
+        }
+        /* A metric with a delta badge is taller than one without. Stretch the
+           cards so a row keeps a single, even bottom edge. */
+        .st-key-model_accuracy_tab [data-testid="stHorizontalBlock"] {
+            align-items: stretch;
+        }
+        .st-key-model_accuracy_tab [data-testid="stMetric"] {
+            height: 100%;
+        }
+        .st-key-model_accuracy_tab [data-testid="stMetric"] > div {
+            height: 100%;
+        }
+
         /* --- Banners and cards written as raw HTML --------------------- */
         .block-container [data-testid="stMarkdownContainer"] > div[style*="border-left"] {
             border-radius: var(--ui-radius) !important;
@@ -267,7 +305,7 @@ LABELS = {
         "tab_patient": "Patient Trajectory & EWS",
         "tab_markers": "Hourly Markers & Sepsis Breakdown",
         "tab_assess": "Clinician /assess Simulator",
-        "tab_model": "Model Validation & RO Checklist",
+        "tab_model": "Model Accuracy",
         "select_specialty": "ICU Specialty",
         "all_specialties": "All ICU Specialties",
         "select_stay": "Select Pseudonymised ICU Stay",
@@ -286,7 +324,7 @@ LABELS = {
         "tab_patient": "Traiectorie Pacient & EWS",
         "tab_markers": "Markeri Orari & Sepsis Existent",
         "tab_assess": "Simulator Clinic /assess",
-        "tab_model": "Validare Model & Lista Spital RO",
+        "tab_model": "Acuratete Model",
         "select_specialty": "Specialitate ICU",
         "all_specialties": "Toate Specialitatile ICU",
         "select_stay": "Selecteaza Internarea ICU Pseudonimizata",
@@ -483,11 +521,20 @@ with tab1:
             else all_stays_df[all_stays_df["first_careunit"] == selected_spec.rsplit(" (", 1)[0]]
         ).reset_index(drop=True)
 
-    def _fmt_stay(i: int) -> str:
-        r = stays_df.iloc[i]
-        return f"{r['pseudonym']} | {r['first_careunit']} | LOS {r['los']*24:.0f}h | {r['admission_type']}"
+    # Build the option labels once as a list. Formatting them lazily through
+    # format_func meant a per-row .iloc lookup for every option, which took
+    # several seconds on the 42k-stay combined cohort.
+    stay_labels = (
+        stays_df["pseudonym"].astype(str)
+        + " | "
+        + stays_df["first_careunit"].astype(str)
+        + " | LOS "
+        + (stays_df["los"].astype(float) * 24.0).round(0).astype("Int64").astype(str)
+        + "h | "
+        + stays_df["admission_type"].astype(str)
+    ).tolist()
 
-    sel_idx = st.selectbox(t["select_stay"], range(len(stays_df)), format_func=_fmt_stay)
+    sel_idx = st.selectbox(t["select_stay"], range(len(stays_df)), format_func=lambda i: stay_labels[i])
     stay_row = stays_df.iloc[sel_idx]
     stay_id = stay_row["pseudonym"]
     max_hr = max(1.0, round(float(stay_row["los"]) * 24.0, 1))
@@ -918,57 +965,67 @@ with tab2:
         st.write("Infection Context:", ews_sim.infection_window, ews_sim.infection_factors)
 
 # ===========================================================================
-# TAB 3: Model Validation & Romanian Hospital Stub Checklist
+# TAB 3: Model Accuracy
 # ===========================================================================
 with tab3:
-    st.subheader("Patient-Grouped Cross-Validation (MIMIC-IV Demo, n=99)")
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("AUROC", str(metrics.get("auroc")))
-    m2.metric("AUPRC", str(metrics.get("auprc")))
-    m3.metric("Brier Score", str(metrics.get("brier_score")))
-    m4.metric("Alerts / Patient-Day", str(metrics.get("alert_rate_per_patient_day")))
-    m5.metric("Median Lead Time (h)", str(metrics.get("median_lead_time_hours")))
+    # Three comparison blocks, each built the same way (heading, one-line
+    # caption, metric row). Keeping the structure identical means the space
+    # between blocks is the same everywhere, however long a heading or caption
+    # happens to be.
+    accuracy_tab = st.container(key="model_accuracy_tab", gap="large")
+
+    def _accuracy_block(title: str, note: str, values: list[tuple[str, str, str | None]]) -> None:
+        block = accuracy_tab.container(gap="xsmall")
+        block.subheader(title)
+        if note:
+            block.caption(note)
+        cols = block.columns(len(values))
+        for col, (label, value, delta) in zip(cols, values):
+            col.metric(label, value, delta=delta)
+
+    _accuracy_block(
+        "Patient-Grouped Cross-Validation (MIMIC-IV Demo, n=99)",
+        f"{metrics.get('n_patients')} patients, {metrics.get('n_stays')} ICU stays, "
+        f"{metrics.get('n_positive_stays')} with sepsis onset, via "
+        f"{metrics.get('cv_folds_by_patient')}-fold patient-grouped CV.",
+        [
+            ("AUROC", str(metrics.get("auroc")), None),
+            ("AUPRC", str(metrics.get("auprc")), None),
+            ("Brier Score", str(metrics.get("brier_score")), None),
+            ("Alerts / Patient-Day", str(metrics.get("alert_rate_per_patient_day")), None),
+            ("Median Lead Time (h)", str(metrics.get("median_lead_time_hours")), None),
+        ],
+    )
 
     pn19_metrics_path = ROOT / "models" / "pn2019_metrics.json"
     if pn19_metrics_path.exists():
         import json
         pn_m = json.loads(pn19_metrics_path.read_text())
-        st.subheader(f"Patient-Grouped Cross-Validation ({pn_m.get('dataset')})")
-        p1, p2, p3, p4, p5 = st.columns(5)
-        p1.metric("AUROC (Best)", str(pn_m.get("auroc")), delta=f"LogReg {pn_m.get('logreg_auroc')}")
-        p2.metric("AUPRC", str(pn_m.get("auprc")))
-        p3.metric("Brier Score", str(pn_m.get("brier_score")))
-        p4.metric("Alerts / Patient-Day", str(pn_m.get("alert_rate_per_patient_day")))
-        p5.metric("Median Lead Time (h)", str(pn_m.get("median_lead_time_hours")))
-        st.caption(
-            f"Evaluated on {pn_m.get('n_patients')} eligible stays ({pn_m.get('n_positive_stays')} sepsis-positive stays, "
-            f"{pn_m.get('n_rows')} hourly windows) via {pn_m.get('cv_folds_by_patient')}-fold patient-grouped CV."
+        _accuracy_block(
+            f"Patient-Grouped Cross-Validation ({pn_m.get('dataset')})",
+            f"{pn_m.get('n_patients')} eligible stays ({pn_m.get('n_positive_stays')} sepsis-positive stays, "
+            f"{pn_m.get('n_rows')} hourly windows) via {pn_m.get('cv_folds_by_patient')}-fold patient-grouped CV. "
+            f"Best of 6 candidates; logistic-regression baseline AUROC {pn_m.get('logreg_auroc')}.",
+            [
+                ("AUROC (Best)", str(pn_m.get("auroc")), None),
+                ("AUPRC", str(pn_m.get("auprc")), None),
+                ("Brier Score", str(pn_m.get("brier_score")), None),
+                ("Alerts / Patient-Day", str(pn_m.get("alert_rate_per_patient_day")), None),
+                ("Median Lead Time (h)", str(pn_m.get("median_lead_time_hours")), None),
+            ],
         )
 
     comb_metrics_path = ROOT / "models" / "combined_detection_metrics.json"
     if comb_metrics_path.exists():
         import json
         cm = json.loads(comb_metrics_path.read_text())
-        st.subheader(f"Active / Post-Onset Sepsis Detection ({cm.get('dataset')})")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Detection AUROC", str(cm.get("auroc")))
-        c2.metric("Detection AUPRC", str(cm.get("auprc")))
-        c3.metric("Brier Score", str(cm.get("brier_score")))
-        c4.metric("Total Stays", f"{cm.get('n_stays'):,} ({cm.get('n_sepsis_stays'):,} sepsis)")
-        st.caption(cm.get("temporal_note", ""))
-
-    st.markdown("#### Small-Sample & Clinical Caveats")
-    for c in metrics.get("small_sample_caveats", []):
-        st.write(f"- {c}")
-
-    st.markdown("#### Romanian Hospital Integration Stub Checklist (Not Connected)")
-    st.markdown(
-        """
-- [ ] Hospital Ethics Committee & Institutional Review Board approval
-- [ ] GDPR Data Protection Impact Assessment (DPIA) & Data Processing Agreement (DPA)
-- [ ] Local ICU clinician sign-off on SOFA/EWS thresholds & APS III assumptions
-- [ ] Validated HL7 FHIR R4 / HL7v2 mapping against hospital EHR (strict unit & LOINC audit)
-- [ ] Security review, role-based access control, and audit logging
-- [ ] Romanian/English UI clinical terminology review
-        """
-    )
+        _accuracy_block(
+            f"Active / Post-Onset Sepsis Detection ({cm.get('dataset')})",
+            cm.get("temporal_note", ""),
+            [
+                ("Detection AUROC", str(cm.get("auroc")), None),
+                ("Detection AUPRC", str(cm.get("auprc")), None),
+                ("Brier Score", str(cm.get("brier_score")), None),
+                ("Total Stays", f"{cm.get('n_stays'):,} ({cm.get('n_sepsis_stays'):,} sepsis)", None),
+            ],
+        )
