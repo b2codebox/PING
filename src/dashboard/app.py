@@ -51,7 +51,7 @@ def render_alert_banner(tier: str, risk_label: str, summary: str) -> None:
     st.markdown(
         f"""
         <div style="background:{bg};border-left:6px solid {border};padding:14px 18px;
-                    border-radius:6px;margin:10px 0 16px 0;color:{text};">
+                    border-radius:var(--ui-radius);margin:10px 0 16px 0;color:{text};">
           <div style="font-size:12px;font-weight:700;letter-spacing:0.06em;margin-bottom:4px;">
             {badge}
           </div>
@@ -67,10 +67,194 @@ def render_disclaimer() -> None:
     st.markdown(
         f"""
         <div style="background:#f5f5f5;border:1px solid #bdbdbd;border-left:5px solid #424242;
-                    padding:10px 14px;border-radius:4px;margin-bottom:12px;color:#212121;
+                    padding:10px 14px;border-radius:var(--ui-radius);margin:0 0 14px 0;color:#212121;
                     font-size:13px;font-weight:600;">
           {DISCLAIMER}
         </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def inject_layout_css() -> None:
+    """Apply a single spacing scale so every vertical gap in the app matches.
+
+    Streamlit's defaults mix very large title margins with tight chart margins,
+    which reads as uneven down a long page. These rules set one rhythm:
+    14px between blocks, 18px above a section heading, 8px below it.
+    """
+    st.markdown(
+        """
+        <style>
+        /* --- One corner radius everywhere ---------------------------------
+           The theme sets 8px for Streamlit's own widgets. These rules give the
+           hand-written HTML the same value and catch the few components that
+           do not read the theme (code blocks, dataframe cells, chart frames).
+        */
+        :root {
+            --ui-radius: 8px;
+        }
+
+        /* --- Page frame ------------------------------------------------- */
+        .block-container {
+            padding-top: 2.75rem !important;
+            padding-bottom: 2.5rem !important;
+            max-width: 1320px;
+        }
+
+        /* --- Title block: large heading, tight to its caption ----------- */
+        .block-container h1 {
+            font-size: 1.85rem !important;
+            line-height: 1.22 !important;
+            letter-spacing: -0.015em;
+            margin: 0 0 0.35rem 0 !important;
+            padding: 0 !important;
+        }
+        .block-container [data-testid="stCaptionContainer"] {
+            margin: 0 0 0.9rem 0 !important;
+        }
+        .block-container [data-testid="stCaptionContainer"] p {
+            font-size: 0.82rem;
+            line-height: 1.45;
+        }
+
+        /* --- Tabs: even gap above, single rule below -------------------- */
+        .block-container [data-testid="stTabs"] {
+            margin: 0 0 0.1rem 0;
+        }
+        .block-container [data-testid="stTabs"] > div:first-child {
+            margin-top: -0.55rem;
+        }
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 1.75rem;
+            border-bottom: 1px solid #e6e6e6;
+        }
+        .stTabs [data-baseweb="tab"] {
+            padding: 0.5rem 0 0.65rem 0;
+            margin: 0;
+        }
+
+        /* --- Section headings: same gap above and below everywhere ------ */
+        .block-container [data-testid="stHeading"] {
+            margin: 1.15rem 0 0.5rem 0 !important;
+            padding: 0 !important;
+        }
+        .block-container [data-testid="stHeading"] h2,
+        .block-container [data-testid="stHeading"] h3 {
+            font-size: 1.12rem !important;
+            line-height: 1.35 !important;
+            margin: 0 !important;
+            padding: 0 !important;
+        }
+        /* First heading inside a tab does not need the full top gap. */
+        .block-container [data-testid="stTabs"] [data-testid="stHeading"]:first-child {
+            margin-top: 0.35rem !important;
+        }
+
+        /* --- One rhythm for every stacked element ----------------------- */
+        .block-container [data-testid="stVerticalBlock"] {
+            gap: 0.85rem;
+        }
+        /* Inside a row of columns, keep the same rhythm. */
+        .block-container [data-testid="stHorizontalBlock"] [data-testid="stVerticalBlock"] {
+            gap: 0.6rem;
+        }
+
+        /* --- Charts, tables and metrics sit flush with their heading ---- */
+        .block-container [data-testid="stArrowVegaLiteChart"],
+        .block-container [data-testid="stDataFrame"],
+        .block-container [data-testid="stTable"],
+        .block-container [data-testid="stAltairChart"] {
+            margin: 0 !important;
+        }
+        .block-container [data-testid="stMetric"] {
+            padding: 0.6rem 0.75rem;
+            border: 1px solid #e8e8e8;
+            border-radius: var(--ui-radius);
+        }
+        .block-container [data-testid="stMetric"] label p {
+            font-size: 0.78rem;
+        }
+
+        /* --- Sliders, inputs and buttons share one row height ----------- */
+        .block-container [data-testid="stSlider"],
+        .block-container [data-testid="stNumberInput"],
+        .block-container [data-testid="stButton"] {
+            margin: 0 !important;
+        }
+        .block-container [data-testid="stWidgetLabel"] {
+            margin-bottom: 0.2rem;
+        }
+
+        /* --- Lists inside the EWS breakdown do not add their own gaps --- */
+        .block-container [data-testid="stMarkdownContainer"] ul {
+            margin: 0.15rem 0 0.15rem 0;
+            padding-left: 1.1rem;
+        }
+        .block-container [data-testid="stMarkdownContainer"] li {
+            margin: 0.1rem 0;
+        }
+
+        /* --- Banners align to the same rhythm --------------------------- */
+        .block-container [data-testid="stMarkdownContainer"] > div[style*="border-left"] {
+            margin-top: 0 !important;
+        }
+
+        /* --- Sidebar: tighter, consistent stack ------------------------- */
+        [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
+            gap: 0.7rem;
+        }
+        [data-testid="stSidebar"] [data-testid="stWidgetLabel"] {
+            margin-bottom: 0.15rem;
+        }
+        [data-testid="stSidebar"] h3 {
+            font-size: 1rem !important;
+            margin: 0.15rem 0 0.55rem 0 !important;
+            padding: 0 !important;
+        }
+        [data-testid="stSidebar"] hr {
+            margin: 0.9rem 0 !important;
+        }
+
+        /* --- Radius catch-all for components outside the theme ---------- */
+        .block-container [data-testid="stCode"],
+        .block-container [data-testid="stCodeBlock"],
+        .block-container [data-testid="stExpander"] details,
+        .block-container [data-testid="stAlert"],
+        .block-container [data-testid="stNotification"],
+        .block-container [data-testid="stDataFrame"] > div,
+        .block-container [data-testid="stDataFrame"] [role="grid"],
+        .block-container [data-testid="stTable"] table,
+        .block-container [data-testid="stMetric"],
+        .block-container [data-testid="stMultiSelect"] [data-baseweb="tag"],
+        .block-container [data-baseweb="select"] > div,
+        .block-container [data-baseweb="input"] > div,
+        .block-container [data-baseweb="textarea"] > div,
+        .block-container [data-baseweb="popover"] [role="listbox"],
+        .block-container [data-baseweb="menu"] ul,
+        .block-container [data-testid="stButton"] button,
+        .block-container [data-testid="stBaseButton-secondary"],
+        .block-container [data-testid="stDownloadButton"] button,
+        .block-container [data-testid="stFileUploaderDropzone"],
+        .block-container [data-testid="stVegaLiteChart"],
+        .block-container [data-testid="stArrowVegaLiteChart"],
+        .block-container [data-testid="stAltairChart"],
+        .block-container [data-testid="stTabs"] [data-baseweb="tab-highlight"],
+        [data-testid="stSidebar"] [data-baseweb="select"] > div,
+        [data-testid="stSidebar"] [data-baseweb="input"] > div,
+        [data-testid="stSidebar"] [data-baseweb="popover"] [role="listbox"],
+        [data-testid="stSidebar"] [data-baseweb="menu"] ul,
+        [data-testid="stSidebar"] [data-baseweb="tag"],
+        [data-testid="stSidebar"] [data-testid="stButton"] button,
+        [data-testid="stSidebar"] [data-testid="stAlert"] {
+            border-radius: var(--ui-radius) !important;
+        }
+
+        /* --- Banners and cards written as raw HTML --------------------- */
+        .block-container [data-testid="stMarkdownContainer"] > div[style*="border-left"] {
+            border-radius: var(--ui-radius) !important;
+        }
+        </style>
         """,
         unsafe_allow_html=True,
     )
@@ -226,6 +410,7 @@ selected_meds = st.sidebar.multiselect(
 if not med_options:
     st.sidebar.caption("No medication or antimicrobial records in this dataset.")
 
+inject_layout_css()
 render_disclaimer()
 st.title(t["title"])
 st.caption(f"{t['subtitle']} | Active dataset: {dataset_choice} ({len(cohort.cohort)} stays)")
@@ -541,7 +726,7 @@ with tab_markers:
     st.markdown(
         f"""
         <div style="background:{sepsis_bg};border-left:6px solid {sepsis_border};padding:12px 16px;
-                    border-radius:6px;margin:6px 0 14px 0;color:{sepsis_txt};">
+                    border-radius:var(--ui-radius);margin:6px 0 14px 0;color:{sepsis_txt};">
           <div style="font-size:15px;font-weight:600;">{sepsis_headline}</div>
           <div style="font-size:13px;margin-top:4px;">
             Infection Window: <b>{m_ews.infection_window}</b> |
