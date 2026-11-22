@@ -1,0 +1,73 @@
+# ---------------------------------------------------------------------------
+# Raw source data — NEVER commit.
+# MIMIC-IV and PhysioNet/CinC 2019 are governed by PhysioNet data use
+# agreements that prohibit redistribution, and the raw extracts retain
+# original subject_id / hadm_id / stay_id identifiers. Re-download them from
+# PhysioNet (credentialed access) before re-running the ingestion step.
+# ---------------------------------------------------------------------------
+data/raw/
+
+# Synthetic FHIR fixtures are generated at runtime, not shared.
+data/mock_fhir/*
+!data/mock_fhir/.gitkeep
+
+# ---------------------------------------------------------------------------
+# Committed on purpose (do not add these to the ignore list):
+#   data/processed*/   pseudonymised Parquet caches the dashboard reads
+#   models/            metrics JSON + small pickled pipelines
+# Even so: keep any repository containing these caches PRIVATE.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# ---------------------------------------------------------------------------
+# Secrets — never commit credentials of any kind.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+.dev.vars
+.streamlit/secrets.toml
+*.pem
+*.key
+.netrc
+
+# ---------------------------------------------------------------------------
+# OS / editor noise
+# ---------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# ---------------------------------------------------------------------------
+# Workspace tooling
+# ---------------------------------------------------------------------------
+.freecode/
+.freecode-source-ready
