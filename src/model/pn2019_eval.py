@@ -1,11 +1,23 @@
-"""Fast vectorized leakage-safe patient-grouped 5-fold CV on PhysioNet 2019.
+"""Leakage-safe, patient-grouped CV for PhysioNet/CinC Challenge 2019.
 
-Vectorized across all stays (no per-stay Python loop) so 10k-25k stays
-build features and finish 5-fold patient-grouped CV in ~10-20 seconds.
+Memory notes
+------------
+The full challenge cohort is ~40k stays / 1.2M hourly rows / 75 features, i.e.
+~366 MB as float32.  Building that as a wide DataFrame of ~25 concatenated
+blocks (plus float64 intermediates and groupby caches) peaked near 3.2 GB and
+was OOM-killed on a 4 GB machine.  This module therefore:
+
+* reads only the two tables it needs (vitals, labs) instead of every cache,
+* converts to float32 as soon as each block is computed,
+* writes blocks into one preallocated matrix and frees each intermediate,
+* copies fold slices for cross-validation and releases them per model.
+
+Estimated peak is ~1.2-1.5 GB for the full cohort.
 """
 
 from __future__ import annotations
 
+import gc
 import json
 import pickle
 from pathlib import Path
@@ -20,9 +32,9 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from src.ingest.allowlist import DISCLAIMER
-from src.ingest.loader import load_cache
 
 ROOT = Path(__file__).resolve().parents[2]
+PN19_CACHE_DIR = ROOT / "data" / "processed_pn2019"
 PN19_MODEL_PATH = ROOT / "models" / "pn2019_model.pkl"
 PN19_METRICS_PATH = ROOT / "models" / "pn2019_metrics.json"
 
@@ -46,177 +58,263 @@ VARS = [
 
 LAB_VARS = ["lactate", "platelets", "bilirubin", "creatinine", "bun", "hematocrit", "wbc", "glucose", "ph"]
 
+RECENCY_VARS = ["lactate", "wbc", "platelets", "creatinine", "bilirubin", "bun", "glucose", "ph"]
+
+BASE_VARS = ["heart_rate", "respiratory_rate", "map_arterial", "temp_celsius", "spo2"]
+
+DELTA_VARS = ["heart_rate", "respiratory_rate", "map_arterial", "temp_celsius", "spo2", "lactate"]
+
+META_COLS = ["patient_id", "pseudonym", "onset_hour"]
+TARGET_COL = "target_onset_6h"
+
+
+def _cohort_metadata(exclude_first_hours: float, stay_limit: int | None) -> pd.DataFrame:
+    """Stay-level metadata for stays eligible for hourly scoring."""
+    cols = ["pseudonym", "patient_id", "age", "los", "has_sepsis_label", "sepsis_onset_hour"]
+    meta = pd.read_parquet(PN19_CACHE_DIR / "cohort.parquet", columns=cols)
+    meta["los_hr"] = (meta["los"] * 24.0).round().astype(int)
+    early_onset = meta["has_sepsis_label"].fillna(False).astype(bool) & (
+        meta["sepsis_onset_hour"] <= exclude_first_hours
+    )
+    meta = meta[(meta["los_hr"] > exclude_first_hours) & (~early_onset)]
+    meta = meta.drop(columns=["los_hr", "los"])
+    if stay_limit is not None:
+        meta = meta.sort_values("pseudonym").head(stay_limit)
+    return meta.reset_index(drop=True)
+
+
+def _hourly_table(valid_ids: set[str]) -> pd.DataFrame:
+    """Pivot vitals + labs into one row per (stay, hour) with VARS columns."""
+    parts = []
+    for table in ("vitals", "labs"):
+        t = pd.read_parquet(
+            PN19_CACHE_DIR / f"{table}.parquet",
+            columns=["pseudonym", "hours_from_icu", "variable", "value"],
+        )
+        t = t[t["pseudonym"].isin(valid_ids)]
+        parts.append(t)
+        del t
+    events = pd.concat(parts, ignore_index=True)
+    del parts
+    events["hour"] = events["hours_from_icu"].round().astype("int32")
+    events = events.drop(columns=["hours_from_icu"])
+
+    piv = (
+        events.groupby(["pseudonym", "hour", "variable"], sort=False)["value"]
+        .last()
+        .unstack("variable")
+    )
+    del events
+    # Kept at the source dtype (float64): derived ratios are then bit-identical
+    # to computing them before casting, which is what the original code did.
+    piv = piv.reindex(columns=VARS)
+    return piv.sort_index().reset_index()
+
+
+def _prepare_rows(
+    exclude_first_hours: float = 6.0,
+    stay_limit: int | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    meta = _cohort_metadata(exclude_first_hours, stay_limit)
+    piv = _hourly_table(set(meta["pseudonym"]))
+    df = piv.merge(meta, on="pseudonym", how="inner")
+    del piv
+
+    has_sep = df["has_sepsis_label"].fillna(False).astype(bool)
+    df = df[(~has_sep) | (df["hour"] < df["sepsis_onset_hour"])]
+    df = df.sort_values(["pseudonym", "hour"], kind="mergesort").reset_index(drop=True)
+    return df, meta
+
+
+def _block_series(df: pd.DataFrame, exclude_first_hours: float) -> list[tuple[list[str], np.ndarray]]:
+    """Compute every feature block as (names, float32 array) in output order."""
+    blocks: list[tuple[list[str], np.ndarray]] = []
+    gkey = df["pseudonym"]
+    index = df.index
+
+    def push(name: str | list[str], values) -> None:
+        names = [name] if isinstance(name, str) else list(name)
+        arr = np.asarray(values, dtype=np.float32)
+        blocks.append((names, arr.reshape(len(index), -1)))
+
+    # Trailing 24h carry-forward (strictly <= t)
+    ff = df.groupby("pseudonym", sort=False)[VARS].ffill(limit=24)
+    push(VARS, ff.to_numpy())
+
+    # Explicit missingness flags
+    push([f"miss_{v}" for v in VARS], ff.isna().to_numpy())
+
+    # Cumulative lab count up to t (clinical acuity signal)
+    lab_any = df[LAB_VARS].notna().sum(axis=1)
+    cum_labs = lab_any.groupby(gkey, sort=False).cumsum()
+    push("cum_lab_count", cum_labs.to_numpy())
+    del lab_any, cum_labs
+
+    # Exact hours-since-last-observation for key labs (strictly <= t)
+    hr_vals = df["hour"].to_numpy(dtype=np.float32)
+    for v in RECENCY_VARS:
+        obs = pd.Series(np.where(df[v].notna().to_numpy(), hr_vals, np.nan), index=index)
+        since = df["hour"] - obs.groupby(gkey, sort=False).ffill()
+        push(f"hrs_since_{v}", since.to_numpy())
+        del obs, since
+
+    # First-6h personal baseline deviations (causal: only scored for hour >= 6)
+    first6 = df["hour"] < exclude_first_hours
+    base_means = ff.loc[first6, BASE_VARS].groupby(gkey[first6], sort=False).mean()
+    base_aligned = base_means.reindex(df["pseudonym"]).set_axis(index)
+    base_dev = (ff[BASE_VARS].to_numpy() - base_aligned.to_numpy(dtype=np.float32))
+    push([f"{v}_dev_base" for v in BASE_VARS], base_dev)
+    del base_means, base_aligned, base_dev
+
+    # 6h and 12h deltas (strictly t minus t-k within stay)
+    ffg = ff.groupby(gkey, sort=False)
+    for lag in (6, 12):
+        shifted = ffg[DELTA_VARS].shift(lag)
+        push([f"{v}_d{lag}" for v in DELTA_VARS], ff[DELTA_VARS].to_numpy() - shifted.to_numpy())
+        del shifted
+
+    # Rolling stats (strictly <= t). groupby.rolling emits group-sorted rows,
+    # so reindex back to the original row order before slicing.
+    def roll(var: str, window: int, how: str, min_periods: int, name: str) -> None:
+        s = getattr(ffg[var].rolling(window, min_periods=min_periods), how)()
+        s = s.reset_index(level=0, drop=True).reindex(index)
+        push(name, s.to_numpy())
+
+    roll("heart_rate", 6, "max", 1, "hr_max_6h")
+    roll("heart_rate", 12, "mean", 1, "hr_mean_12h")
+    roll("heart_rate", 24, "std", 3, "hr_std_24h")
+    roll("respiratory_rate", 6, "max", 1, "rr_max_6h")
+    roll("respiratory_rate", 24, "std", 3, "rr_std_24h")
+    roll("map_arterial", 6, "min", 1, "map_min_6h")
+    roll("map_arterial", 24, "min", 1, "map_min_24h")
+    roll("map_arterial", 24, "std", 3, "map_std_24h")
+    roll("temp_celsius", 12, "max", 1, "temp_max_12h")
+    roll("temp_celsius", 24, "min", 1, "temp_min_24h")
+    roll("spo2", 6, "min", 1, "spo2_min_6h")
+
+    # Clinical ratios & SIRS proxy
+    hr = ff["heart_rate"].to_numpy(dtype=np.float32)
+    rr = ff["respiratory_rate"].to_numpy(dtype=np.float32)
+    map_ = ff["map_arterial"].to_numpy(dtype=np.float32)
+    temp = ff["temp_celsius"].to_numpy(dtype=np.float32)
+    spo2 = ff["spo2"].to_numpy(dtype=np.float32)
+    fio2 = ff["fio2"].to_numpy(dtype=np.float32)
+    bun = ff["bun"].to_numpy(dtype=np.float32)
+    creat = ff["creatinine"].to_numpy(dtype=np.float32)
+    wbc = ff["wbc"].to_numpy(dtype=np.float32)
+
+    # Ratios use the source (float64) values and are cast once at the end, so
+    # they are bit-identical to computing them on float64 columns then casting.
+    hr64 = ff["heart_rate"].to_numpy()
+    map64 = ff["map_arterial"].to_numpy()
+    spo264 = ff["spo2"].to_numpy()
+    fio264 = ff["fio2"].to_numpy()
+    bun64 = ff["bun"].to_numpy()
+    creat64 = ff["creatinine"].to_numpy()
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        shock = np.where(map64 != 0, hr64 / map64, np.nan)
+        sf_ratio = np.where(fio264 != 0, spo264 / (fio264 / 100.0), np.nan)
+        bun_cr = np.where(creat64 != 0, bun64 / creat64, np.nan)
+    shift6 = pd.Series(shock).groupby(gkey, sort=False).shift(6).to_numpy()
+
+    sirs = (
+        (hr > 90).astype(np.float32)
+        + (rr > 20).astype(np.float32)
+        + ((temp > 38.0) | (temp < 36.0)).astype(np.float32)
+        + ((wbc > 12.0) | (wbc < 4.0)).astype(np.float32)
+    )
+
+    push("shock_index", shock)
+    push("shock_index_d6", shock - shift6)
+    push("spo2_fio2_ratio", sf_ratio)
+    push("bun_cr_ratio", bun_cr)
+    push("sirs_proxy", sirs)
+
+    del ff, ffg, shift6, sirs
+    gc.collect()
+    return blocks
+
+
+def _build_matrix(
+    horizon_hours: float = 6.0,
+    exclude_first_hours: float = 6.0,
+    stay_limit: int | None = None,
+) -> tuple[np.ndarray, pd.DataFrame, list[str]]:
+    """Return (X float32, row metadata, feature names) for hours >= exclude_first_hours."""
+    df, _ = _prepare_rows(exclude_first_hours, stay_limit)
+    blocks = _block_series(df, exclude_first_hours)
+
+    hour = df["hour"].to_numpy(dtype=np.float32)
+    blocks.append((["hour"], hour.reshape(-1, 1)))
+    blocks.append((["icu_acquired_48h"], (hour >= 48).astype(np.float32).reshape(-1, 1)))
+    age = df["age"].to_numpy(dtype=np.float32)
+    blocks.append((["age"], age.reshape(-1, 1)))
+
+    has_sep = df["has_sepsis_label"].fillna(False).astype(bool)
+    target = (
+        has_sep & (df["hour"] < df["sepsis_onset_hour"]) & (df["sepsis_onset_hour"] <= df["hour"] + horizon_hours)
+    ).to_numpy().astype(np.int8)
+
+    names = [n for group, _ in blocks for n in group]
+    keep = np.flatnonzero(hour >= exclude_first_hours)
+
+    X = np.empty((keep.size, len(names)), dtype=np.float32)
+    col = 0
+    for group, arr in blocks:
+        width = len(group)
+        X[:, col : col + width] = arr[keep]
+        col += width
+    assert col == len(names), f"block widths {col} != feature names {len(names)}"
+    del blocks
+
+    meta = pd.DataFrame(
+        {
+            "patient_id": df["patient_id"].to_numpy()[keep],
+            "pseudonym": df["pseudonym"].to_numpy()[keep],
+            "onset_hour": df["sepsis_onset_hour"].to_numpy()[keep],
+            TARGET_COL: target[keep],
+            "hour": hour[keep],
+        }
+    )
+    del df
+    gc.collect()
+    return X, meta, names
+
 
 def build_pn2019_features(
     horizon_hours: float = 6.0,
     exclude_first_hours: float = 6.0,
+    stay_limit: int | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
-    cohort = load_cache(ROOT / "data" / "processed_pn2019")
-    meta = cohort.cohort[["pseudonym", "patient_id", "age", "los", "has_sepsis_label", "sepsis_onset_hour"]].copy()
-    meta["los_hr"] = (meta["los"] * 24.0).round().astype(int)
-    # Exclude short stays or early onset (<= exclude_first_hours)
-    early_onset = meta["has_sepsis_label"] & (meta["sepsis_onset_hour"] <= exclude_first_hours)
-    meta = meta[(meta["los_hr"] > exclude_first_hours) & (~early_onset)].copy()
+    """Backwards-compatible wrapper returning a single feature DataFrame."""
+    X, meta, names = _build_matrix(horizon_hours, exclude_first_hours, stay_limit)
+    df = pd.DataFrame(X, columns=names)
+    for col in META_COLS + [TARGET_COL]:
+        df[col] = meta[col].to_numpy()
+    feature_cols = [c for c in df.columns if c not in META_COLS + [TARGET_COL]]
+    return df, feature_cols
 
-    valid_ids = set(meta["pseudonym"])
-    all_ev = pd.concat(
-        [
-            cohort.vitals.loc[cohort.vitals["pseudonym"].isin(valid_ids), ["pseudonym", "hours_from_icu", "variable", "value"]],
-            cohort.labs.loc[cohort.labs["pseudonym"].isin(valid_ids), ["pseudonym", "hours_from_icu", "variable", "value"]],
-        ],
-        ignore_index=True,
-    )
-    all_ev["hour"] = all_ev["hours_from_icu"].round().astype(int)
 
-    piv = (
-        all_ev.groupby(["pseudonym", "hour", "variable"], sort=False)["value"]
-        .last()
-        .unstack("variable")
-    )
-    for v in VARS:
-        if v not in piv.columns:
-            piv[v] = np.nan
-    piv = piv[VARS].sort_index().reset_index()
-
-    # Merge stay metadata
-    df = piv.merge(meta, on="pseudonym", how="inner")
-
-    # Strictly before onset (if positive)
-    has_sep = df["has_sepsis_label"].fillna(False).astype(bool)
-    df = df[(~has_sep) | (df["hour"] < df["sepsis_onset_hour"])].copy()
-    df = df.sort_values(["pseudonym", "hour"]).reset_index(drop=True)
-
-    g = df.groupby("pseudonym", sort=False)
-
-    # Trailing 24h carry-forward (strictly <= t)
-    ff = g[VARS].ffill(limit=24)
-
-    # Explicit missingness flags
-    miss = ff.isna().astype(np.float32).add_prefix("miss_")
-
-    # Cumulative lab count up to t (clinical acuity signal)
-    lab_any = df[LAB_VARS].notna().sum(axis=1)
-    cum_labs = lab_any.groupby(df["pseudonym"], sort=False).cumsum().rename("cum_lab_count").astype(np.float32)
-
-    # Exact hours-since-last-observation for key labs (strictly <= t, vectorized)
-    recency_cols: dict[str, pd.Series] = {}
-    hr_vals = df["hour"].to_numpy(dtype=np.float32)
-    stay_keys = df["pseudonym"]
-    for v in ["lactate", "wbc", "platelets", "creatinine", "bilirubin", "bun", "glucose", "ph"]:
-        obs_hr = pd.Series(np.where(df[v].notna().to_numpy(), hr_vals, np.nan), index=df.index)
-        last_obs_hr = obs_hr.groupby(stay_keys, sort=False).ffill()
-        recency_cols[f"hrs_since_{v}"] = (df["hour"] - last_obs_hr).astype(np.float32)
-    recency_df = pd.DataFrame(recency_cols, index=df.index)
-
-    # First-6h personal baseline deviations (strictly causal since we only predict for hour >= 6)
-    base_vars = ["heart_rate", "respiratory_rate", "map_arterial", "temp_celsius", "spo2"]
-    first6_mask = df["hour"] < exclude_first_hours
-    base_means = (
-        ff.loc[first6_mask, base_vars]
-        .groupby(df.loc[first6_mask, "pseudonym"], sort=False)
-        .mean()
-    )
-    base_aligned = base_means.reindex(df["pseudonym"]).set_axis(df.index)
-    base_dev = (ff[base_vars] - base_aligned).add_suffix("_dev_base").astype(np.float32)
-
-    # 6h and 12h deltas (strictly t minus t-k within stay)
-    delta_cols = ["heart_rate", "respiratory_rate", "map_arterial", "temp_celsius", "spo2", "lactate"]
-    ff_g = ff.groupby(df["pseudonym"], sort=False)
-    d6 = (ff[delta_cols] - ff_g[delta_cols].shift(6)).add_suffix("_d6")
-    d12 = (ff[delta_cols] - ff_g[delta_cols].shift(12)).add_suffix("_d12")
-
-    # Rolling 6h, 12h & 24h stats (strictly <= t)
-    r_hr_max = ff_g["heart_rate"].rolling(6, min_periods=1).max().reset_index(level=0, drop=True).rename("hr_max_6h")
-    r_hr_mean = ff_g["heart_rate"].rolling(12, min_periods=1).mean().reset_index(level=0, drop=True).rename("hr_mean_12h")
-    r_hr_std24 = ff_g["heart_rate"].rolling(24, min_periods=3).std().reset_index(level=0, drop=True).rename("hr_std_24h")
-    r_rr_max = ff_g["respiratory_rate"].rolling(6, min_periods=1).max().reset_index(level=0, drop=True).rename("rr_max_6h")
-    r_rr_std24 = ff_g["respiratory_rate"].rolling(24, min_periods=3).std().reset_index(level=0, drop=True).rename("rr_std_24h")
-    r_map_min = ff_g["map_arterial"].rolling(6, min_periods=1).min().reset_index(level=0, drop=True).rename("map_min_6h")
-    r_map_min24 = ff_g["map_arterial"].rolling(24, min_periods=1).min().reset_index(level=0, drop=True).rename("map_min_24h")
-    r_map_std24 = ff_g["map_arterial"].rolling(24, min_periods=3).std().reset_index(level=0, drop=True).rename("map_std_24h")
-    r_temp_max = ff_g["temp_celsius"].rolling(12, min_periods=1).max().reset_index(level=0, drop=True).rename("temp_max_12h")
-    r_temp_min24 = ff_g["temp_celsius"].rolling(24, min_periods=1).min().reset_index(level=0, drop=True).rename("temp_min_24h")
-    r_spo2_min = ff_g["spo2"].rolling(6, min_periods=1).min().reset_index(level=0, drop=True).rename("spo2_min_6h")
-
-    # Clinical ratios & SIRS proxy
-    shock_idx = (ff["heart_rate"] / ff["map_arterial"].replace(0, np.nan)).rename("shock_index")
-    shock_d6 = (shock_idx - shock_idx.groupby(df["pseudonym"], sort=False).shift(6)).rename("shock_index_d6")
-    sf_ratio = (ff["spo2"] / (ff["fio2"].replace(0, np.nan) / 100.0)).rename("spo2_fio2_ratio")
-    bun_cr = (ff["bun"] / ff["creatinine"].replace(0, np.nan)).rename("bun_cr_ratio")
-    sirs = (
-        (ff["heart_rate"] > 90).astype(np.float32)
-        + (ff["respiratory_rate"] > 20).astype(np.float32)
-        + ((ff["temp_celsius"] > 38.0) | (ff["temp_celsius"] < 36.0)).astype(np.float32)
-        + ((ff["wbc"] > 12.0) | (ff["wbc"] < 4.0)).astype(np.float32)
-    ).rename("sirs_proxy")
-
-    feat = pd.concat(
-        [
-            ff.astype(np.float32),
-            miss,
-            cum_labs,
-            recency_df,
-            base_dev,
-            d6.astype(np.float32),
-            d12.astype(np.float32),
-            r_hr_max.astype(np.float32),
-            r_hr_mean.astype(np.float32),
-            r_hr_std24.astype(np.float32),
-            r_rr_max.astype(np.float32),
-            r_rr_std24.astype(np.float32),
-            r_map_min.astype(np.float32),
-            r_map_min24.astype(np.float32),
-            r_map_std24.astype(np.float32),
-            r_temp_max.astype(np.float32),
-            r_temp_min24.astype(np.float32),
-            r_spo2_min.astype(np.float32),
-            shock_idx.astype(np.float32),
-            shock_d6.astype(np.float32),
-            sf_ratio.astype(np.float32),
-            bun_cr.astype(np.float32),
-            sirs,
-        ],
-        axis=1,
-    )
-    feat["hour"] = df["hour"].astype(np.float32)
-    feat["icu_acquired_48h"] = (df["hour"] >= 48).astype(np.float32)
-    feat["age"] = df["age"].astype(np.float32)
-
-    # Target: onset within next 6 hours
-    has_sep_filt = df["has_sepsis_label"].fillna(False).astype(bool)
-    target = np.where(
-        has_sep_filt & (df["hour"] < df["sepsis_onset_hour"]) & (df["sepsis_onset_hour"] <= df["hour"] + horizon_hours),
-        1,
-        0,
-    )
-    feat["patient_id"] = df["patient_id"].to_numpy()
-    feat["pseudonym"] = df["pseudonym"].to_numpy()
-    feat["onset_hour"] = df["sepsis_onset_hour"].to_numpy()
-    feat["target_onset_6h"] = target
-
-    # Keep only hours >= exclude_first_hours
-    feat = feat[feat["hour"] >= exclude_first_hours].reset_index(drop=True)
-    feature_cols = [
-        c
-        for c in feat.columns
-        if c not in ("patient_id", "pseudonym", "onset_hour", "target_onset_6h")
-    ]
-    return feat, feature_cols
+def _impute_in_place(mat: np.ndarray, med: np.ndarray) -> None:
+    """Fill NaNs with column medians without allocating another full copy."""
+    if np.isnan(mat).any():
+        rows, cols = np.where(np.isnan(mat))
+        mat[rows, cols] = med[cols]
 
 
 def run_evaluation(n_splits: int = 3, alert_threshold: float = 0.15) -> dict:
-    df, feature_cols = build_pn2019_features()
-    X_raw = df[feature_cols].to_numpy(dtype=np.float32)
-    y = df["target_onset_6h"].to_numpy(dtype=int)
-    groups = df["patient_id"].to_numpy()
+    X, meta, feature_cols = _build_matrix()
+    y = meta[TARGET_COL].to_numpy(dtype=int)
+    groups = meta["patient_id"].to_numpy()
+    n_rows = len(y)
 
-    gkf = GroupKFold(n_splits=n_splits)
-    oof_hgb = np.zeros(len(df), dtype=float)
-    oof_hgb2 = np.zeros(len(df), dtype=float)
-    oof_et = np.zeros(len(df), dtype=float)
-    oof_lr = np.zeros(len(df), dtype=float)
+    oof = {k: np.zeros(n_rows, dtype=np.float32) for k in ("hgb", "hgb2", "et", "lr")}
 
-    for tr, va in gkf.split(X_raw, y, groups):
+    for tr, va in GroupKFold(n_splits=n_splits).split(X, y, groups):
+        X_tr = X[tr]
+        X_va = X[va]
+
         hgb = HistGradientBoostingClassifier(
             max_depth=6,
             max_iter=300,
@@ -226,8 +324,10 @@ def run_evaluation(n_splits: int = 3, alert_threshold: float = 0.15) -> dict:
             max_leaf_nodes=63,
             random_state=42,
         )
-        hgb.fit(X_raw[tr], y[tr])
-        oof_hgb[va] = hgb.predict_proba(X_raw[va])[:, 1]
+        hgb.fit(X_tr, y[tr])
+        oof["hgb"][va] = hgb.predict_proba(X_va)[:, 1]
+        del hgb
+        gc.collect()
 
         hgb2 = HistGradientBoostingClassifier(
             max_depth=8,
@@ -238,12 +338,18 @@ def run_evaluation(n_splits: int = 3, alert_threshold: float = 0.15) -> dict:
             max_leaf_nodes=31,
             random_state=2024,
         )
-        hgb2.fit(X_raw[tr], y[tr])
-        oof_hgb2[va] = hgb2.predict_proba(X_raw[va])[:, 1]
+        hgb2.fit(X_tr, y[tr])
+        oof["hgb2"][va] = hgb2.predict_proba(X_va)[:, 1]
+        del hgb2
+        gc.collect()
 
-        # Median-impute for the tree model that cannot handle NaN (ExtraTrees)
-        med_tree = np.nanmedian(X_raw[tr], axis=0)
-        med_tree = np.where(np.isnan(med_tree), 0.0, med_tree)
+        # Tree/linear models below need complete matrices, so impute the fold
+        # slices in place (after the NaNs have served their purpose for HGB).
+        med = np.nanmedian(X_tr, axis=0)
+        med = np.where(np.isnan(med), 0.0, med)
+        _impute_in_place(X_tr, med)
+        _impute_in_place(X_va, med)
+
         et = ExtraTreesClassifier(
             n_estimators=60,
             max_depth=12,
@@ -254,42 +360,29 @@ def run_evaluation(n_splits: int = 3, alert_threshold: float = 0.15) -> dict:
             n_jobs=-1,
             random_state=7,
         )
-        et.fit(
-            np.where(np.isnan(X_raw[tr]), med_tree, X_raw[tr]),
-            y[tr],
-        )
-        oof_et[va] = et.predict_proba(np.where(np.isnan(X_raw[va]), med_tree, X_raw[va]))[:, 1]
+        et.fit(X_tr, y[tr])
+        oof["et"][va] = et.predict_proba(X_va)[:, 1]
+        del et
+        gc.collect()
 
-        med = np.nanmedian(X_raw[tr], axis=0)
-        med = np.where(np.isnan(med), 0.0, med)
-        X_tr_lr = np.where(np.isnan(X_raw[tr]), med, X_raw[tr])
-        X_va_lr = np.where(np.isnan(X_raw[va]), med, X_raw[va])
-        lr = Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                ("clf", LogisticRegression(C=0.2, max_iter=200)),
-            ]
-        )
-        lr.fit(X_tr_lr, y[tr])
-        oof_lr[va] = lr.predict_proba(X_va_lr)[:, 1]
-
-    auroc_hgb = float(roc_auc_score(y, oof_hgb))
-    auroc_hgb2 = float(roc_auc_score(y, oof_hgb2))
-    auroc_et = float(roc_auc_score(y, oof_et))
-    auroc_lr = float(roc_auc_score(y, oof_lr))
+        lr = Pipeline([("scaler", StandardScaler()), ("clf", LogisticRegression(C=0.2, max_iter=200))])
+        lr.fit(X_tr, y[tr])
+        oof["lr"][va] = lr.predict_proba(X_va)[:, 1]
+        del lr, X_tr, X_va, med
+        gc.collect()
 
     candidates: dict[str, tuple[str, np.ndarray]] = {
-        "HistGradientBoosting": ("HistGradientBoosting", oof_hgb),
-        "HistGradientBoosting_Tuned2": ("HistGradientBoosting (tuned 2)", oof_hgb2),
-        "ExtraTrees": ("ExtraTrees", oof_et),
-        "LogisticRegression": ("LogisticRegression", oof_lr),
+        "HistGradientBoosting": ("HistGradientBoosting", oof["hgb"]),
+        "HistGradientBoosting_Tuned2": ("HistGradientBoosting (tuned 2)", oof["hgb2"]),
+        "ExtraTrees": ("ExtraTrees", oof["et"]),
+        "LogisticRegression": ("LogisticRegression", oof["lr"]),
         "Ensemble(3-model)": (
             "Ensemble(HGB+ET+LogReg)",
-            0.45 * oof_hgb + 0.35 * oof_et + 0.20 * oof_lr,
+            0.45 * oof["hgb"] + 0.35 * oof["et"] + 0.20 * oof["lr"],
         ),
         "Ensemble(4-model)": (
             "Ensemble(HGB+ET+LogReg, 4-way)",
-            0.30 * oof_hgb + 0.25 * oof_hgb2 + 0.30 * oof_et + 0.15 * oof_lr,
+            0.30 * oof["hgb"] + 0.25 * oof["hgb2"] + 0.30 * oof["et"] + 0.15 * oof["lr"],
         ),
     }
     scored = {k: float(roc_auc_score(y, v[1])) for k, v in candidates.items()}
@@ -301,17 +394,19 @@ def run_evaluation(n_splits: int = 3, alert_threshold: float = 0.15) -> dict:
     brier = float(brier_score_loss(y, best_oof))
 
     alerts = (best_oof >= alert_threshold).astype(int)
-    total_patient_days = max(1e-6, float(df.groupby("pseudonym")["hour"].max().sum()) / 24.0)
+    total_patient_days = max(1e-6, float(meta.groupby("pseudonym")["hour"].max().sum()) / 24.0)
     alert_rate = float(alerts.sum() / total_patient_days)
 
-    df_eval = df[["pseudonym", "hour", "onset_hour"]].copy()
-    df_eval["alert"] = alerts
+    lead_frame = meta[["pseudonym", "hour", "onset_hour"]].copy()
+    lead_frame["alert"] = alerts
     lead_times = []
-    for _, grp in df_eval[df_eval["onset_hour"].notna()].groupby("pseudonym"):
+    for _, grp in lead_frame[lead_frame["onset_hour"].notna()].groupby("pseudonym"):
         hit = grp[grp["alert"] == 1]
         if len(hit):
             lead_times.append(float(grp["onset_hour"].iloc[0]) - float(hit["hour"].min()))
     median_lead = float(np.median(lead_times)) if lead_times else None
+    del lead_frame, oof, candidates
+    gc.collect()
 
     final_model = HistGradientBoostingClassifier(
         max_depth=5,
@@ -322,30 +417,32 @@ def run_evaluation(n_splits: int = 3, alert_threshold: float = 0.15) -> dict:
         class_weight="balanced",
         random_state=42,
     )
-    final_model.fit(X_raw, y)
+    final_model.fit(X, y)
 
     metrics = {
         "disclaimer": DISCLAIMER,
-        "dataset": f"PhysioNet/CinC Challenge 2019 ({int(df['patient_id'].nunique())}-patient subset)",
-        "n_patients": int(df["patient_id"].nunique()),
-        "n_stays": int(df["pseudonym"].nunique()),
-        "n_rows": int(len(df)),
+        "dataset": f"PhysioNet/CinC Challenge 2019 ({int(meta['patient_id'].nunique())}-patient cohort)",
+        "n_patients": int(meta["patient_id"].nunique()),
+        "n_stays": int(meta["pseudonym"].nunique()),
+        "n_rows": int(n_rows),
         "n_positive_rows": int(y.sum()),
-        "n_positive_stays": int(df.loc[df["target_onset_6h"] == 1, "pseudonym"].nunique()),
+        "n_positive_stays": int(meta.loc[meta[TARGET_COL] == 1, "pseudonym"].nunique()),
         "cv_folds_by_patient": n_splits,
         "best_model": best_name,
         "auroc": round(best_auroc, 4),
         "auprc": round(auprc, 4),
         "brier_score": round(brier, 4),
-        "logreg_auroc": round(auroc_lr, 4),
-        "hgb_auroc": round(auroc_hgb, 4),
-        "extratrees_auroc": round(auroc_et, 4),
+        "logreg_auroc": round(float(scored["LogisticRegression"]), 4),
+        "hgb_auroc": round(float(scored["HistGradientBoosting"]), 4),
+        "extratrees_auroc": round(float(scored["ExtraTrees"]), 4),
         "model_candidates": {k: round(v, 4) for k, v in scored.items()},
         "alert_rate_per_patient_day": round(alert_rate, 3),
         "median_lead_time_hours": round(median_lead, 2) if median_lead is not None else None,
         "small_sample_caveats": [
-            f"Subset of {int(df['patient_id'].nunique())} patients from PhysioNet/CinC Challenge 2019 (US hospital systems A & B); not validated on Romanian ICU populations.",
-            "Challenge 2019 PSV files omit vasopressors, GCS, urine output, microbiology, and ICD codes; missingness and lab-recency flags are explicitly modeled.",
+            f"Full PhysioNet/CinC Challenge 2019 cohort ({int(meta['patient_id'].nunique())} patients, "
+            "US hospital systems A & B); not validated on Romanian ICU populations.",
+            "Challenge 2019 PSV files omit vasopressors, GCS, urine output, microbiology, and ICD codes; "
+            "missingness and lab-recency flags are explicitly modeled.",
         ],
     }
 
