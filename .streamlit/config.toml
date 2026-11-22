@@ -1,0 +1,13 @@
+[server]
+headless = true
+port = 8501
+
+[browser]
+gatherUsageStats = false
+
+# One corner radius for the whole interface. Every widget Streamlit draws
+# (inputs, buttons, sliders, tabs, tables, expanders, popovers) inherits this,
+# and the hand-written banners/cards in app.py match it explicitly.
+[theme]
+baseRadius = "8px"
+buttonRadius = "8px"
