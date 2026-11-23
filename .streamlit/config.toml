@@ -5,9 +5,22 @@ port = 8501
 [browser]
 gatherUsageStats = false
 
-# One corner radius for the whole interface. Every widget Streamlit draws
-# (inputs, buttons, sliders, tabs, tables, expanders, popovers) inherits this,
-# and the hand-written banners/cards in app.py match it explicitly.
-[theme]
+# Keep the top-right options menu available everywhere. The default "auto"
+# hides the developer entries unless the app is opened from localhost or
+# Streamlit Cloud. "viewer" keeps the theme switch and print while never
+# showing rerun, clear cache or deploy, which ordinary users should not see.
+[client]
+toolbarMode = "viewer"
+
+# Both themes must be declared for Streamlit to offer a Light/Dark switch.
+# The menu builds its theme section only when more than one theme is
+# configured; with none, the switch is omitted entirely and the menu looks
+# like it "doesn't work". Declaring light and dark gives the System / Light /
+# Dark control next to Print.
+[theme.light]
+baseRadius = "8px"
+buttonRadius = "8px"
+
+[theme.dark]
 baseRadius = "8px"
 buttonRadius = "8px"
