@@ -25,7 +25,12 @@ if str(ROOT) not in sys.path:
 import pandas as pd
 import streamlit as st
 
-from src.ews.alerts import evaluate_ews
+from src.ews.alerts import (
+    ALERT_TIER_LABELS,
+    INFECTION_WINDOW_LABELS,
+    VULN_TIER_LABELS,
+    evaluate_ews,
+)
 from src.features.builder import snapshot_at, stay_events
 from src.ingest.allowlist import DISCLAIMER
 from src.ingest.loader import load_cache
@@ -74,6 +79,11 @@ def render_alert_banner(tier: str, risk_label: str, summary: str) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def _window_label(window: str) -> str:
+    """Render an infection-window key as readable text."""
+    return INFECTION_WINDOW_LABELS.get(window, window)
 
 
 def render_disclaimer() -> None:
@@ -355,6 +365,12 @@ LABELS = {
         "infection": "3. Pre-existing (<48h) vs. ICU-acquired (>=48h) Infection Context",
         "drivers": "Top 6-Hour Risk Model Drivers",
         "assess_btn": "Run Prototype Assessment",
+        # Vulnerability tier names, lower case so they read naturally after
+        # "Baseline Vulnerability —".
+        "vuln_tiers": {"standard": "Low", "elevated": "Medium", "high": "High"},
+        # Vulnerability tier names, lower case so they read naturally after
+        # "Vulnerabilitate de Baza —".
+        "vuln_tiers": {"standard": "scazuta", "elevated": "medie", "high": "ridicata"},
     },
     "RO": {
         "title": "Prototip Debut Sepsis, Disfunctie de Organ & Avertizare Timpurie",
@@ -575,11 +591,16 @@ with tab1:
     sel_idx = st.selectbox(t["select_stay"], range(len(stays_df)), format_func=lambda i: stay_labels[i])
     stay_row = stays_df.iloc[sel_idx]
     stay_id = stay_row["pseudonym"]
-    max_hr = max(1.0, round(float(stay_row["los"]) * 24.0, 1))
-    default_hr = round(min(24.0, max_hr), 1)
+    # Whole hours only. Every event timestamp in the cohort sits on an
+    # integer hour, and the snapshot filter is "<= t", so a fractional hour
+    # returns exactly the same result as the hour below it. Offering 12.5
+    # would promise a precision the data does not have. The max is floored
+    # so the slider can actually reach it.
+    max_hr = max(1, int(float(stay_row["los"]) * 24.0))
+    default_hr = min(24, max_hr)
 
     def _set_eval_hour(v: float) -> None:
-        clamped_v = round(max(0.0, min(float(v), max_hr)), 1)
+        clamped_v = max(0, min(int(round(float(v))), max_hr))
         st.session_state["shared_eval_hour"] = clamped_v
         st.session_state["tab1_eval_hour"] = clamped_v
         st.session_state["tab1_eval_num"] = clamped_v
@@ -603,9 +624,9 @@ with tab1:
     with sl_col:
         st.slider(
             t["eval_hour"],
-            min_value=0.0,
+            min_value=0,
             max_value=max_hr,
-            step=1.0,
+            step=1,
             key="tab1_eval_hour",
             on_change=_sync_from,
             args=("tab1_eval_hour",),
@@ -615,9 +636,9 @@ with tab1:
     with num_col:
         st.number_input(
             "Hour",
-            min_value=0.0,
+            min_value=0,
             max_value=max_hr,
-            step=1.0,
+            step=1,
             key="tab1_eval_num",
             label_visibility="collapsed",
             on_change=_sync_from,
@@ -626,7 +647,7 @@ with tab1:
     with inc_col:
         st.button("▶", key="tab1_inc_hr", help="Increase by 1 hour", on_click=_step_hour, args=(1.0,), use_container_width=True)
 
-    eval_hr = float(st.session_state["shared_eval_hour"])
+    eval_hr = int(st.session_state["shared_eval_hour"])
 
     ev = stay_events(cohort, stay_id)
     snap = snapshot_at(cohort, stay_id, eval_hr, events=ev)
@@ -645,7 +666,7 @@ with tab1:
 
     # Shared hourly trajectory (1h step, hours 0..eval_hr) used by both Tab 1 and Tab 1B.
     hourly_rows = []
-    for hr in range(0, int(eval_hr) + 1):
+    for hr in range(0, eval_hr + 1):
         w = window_inputs(ev, float(hr), window_hours=24.0)
         s = compute_sofa(w)
         hourly_rows.append(
@@ -730,7 +751,10 @@ with tab1:
     st.subheader(t["ews_breakdown"])
     e1, e2, e3 = st.columns(3)
     with e1:
-        st.markdown(f"**{t['vuln']}** (`{ews.vulnerability_tier}`)")
+        vuln_label = t["vuln_tiers"].get(
+            ews.vulnerability_tier, VULN_TIER_LABELS.get(ews.vulnerability_tier, ews.vulnerability_tier)
+        )
+        st.markdown(f"**{t['vuln']}** — `{vuln_label}`")
         if ews.vulnerability_factors:
             for item in ews.vulnerability_factors:
                 st.write(f"- {item}")
@@ -745,7 +769,7 @@ with tab1:
             st.caption("No acute deterioration signals at hour t.")
     with e3:
         st.markdown(f"**{t['infection']}**")
-        st.write(f"Window: `{ews.infection_window}`")
+        st.write(f"Window: `{_window_label(ews.infection_window)}`")
         st.write(f"Suspected infection: `{ews.suspected_infection}`")
         if ews.infection_factors:
             for item in ews.infection_factors:
@@ -762,9 +786,9 @@ with tab_markers:
     with msl_col:
         st.slider(
             t["eval_hour"],
-            min_value=0.0,
+            min_value=0,
             max_value=max_hr,
-            step=1.0,
+            step=1,
             key="markers_eval_hour_slider",
             on_change=_sync_from,
             args=("markers_eval_hour_slider",),
@@ -774,9 +798,9 @@ with tab_markers:
     with mnum_col:
         st.number_input(
             "Hour",
-            min_value=0.0,
+            min_value=0,
             max_value=max_hr,
-            step=1.0,
+            step=1,
             key="markers_eval_num",
             label_visibility="collapsed",
             on_change=_sync_from,
@@ -797,10 +821,10 @@ with tab_markers:
     st.subheader("Existing Sepsis Status (<= t)")
     if m_ews.possible_sepsis_alert:
         sepsis_accent = ALERT_STYLES["possible_sepsis"][0]
-        sepsis_headline = "Existing Possible Sepsis Criteria Met (SOFA delta >= 2 + Suspected Infection)"
+        sepsis_headline = "Existing Possible Sepsis Criteria Met (SOFA Δ >= 2 + Suspected Infection)"
     elif m_ews.organ_dysfunction_alert:
         sepsis_accent = ALERT_STYLES["organ_dysfunction"][0]
-        sepsis_headline = "Organ Dysfunction Present (SOFA delta >= 2), Without Confirmed Infection Flag"
+        sepsis_headline = "Organ Dysfunction Present (SOFA Δ >= 2), Without Confirmed Infection Flag"
     elif m_ews.suspected_infection:
         sepsis_accent = ALERT_STYLES["early_warning"][0]
         sepsis_headline = "Suspected Infection Present, Below SOFA Delta >= 2 Threshold"
@@ -816,8 +840,8 @@ with tab_markers:
                     border-radius:var(--ui-radius);margin:6px 0 14px 0;">
           <div style="font-size:15px;font-weight:600;">{sepsis_headline}</div>
           <div style="font-size:13px;margin-top:4px;">
-            Infection Window: <b>{m_ews.infection_window}</b> |
-            SOFA: <b>{m_sofa.total}</b> (baseline {m_snap['sofa_baseline']}, delta {m_snap['sofa_delta']:+d}) |
+            Infection Window: <b>{_window_label(m_ews.infection_window)}</b> |
+            SOFA: <b>{m_sofa.total}</b> (baseline {m_snap['sofa_baseline']}, Δ {m_snap['sofa_delta']:+d}) |
             Suspected Infection: <b>{'Yes' if m_ews.suspected_infection else 'No'}</b>
           </div>
         </div>
@@ -827,7 +851,7 @@ with tab_markers:
 
     s1, s2, s3, s4 = st.columns(4)
     s1.metric("Existing Sepsis Alert", "Yes" if m_ews.possible_sepsis_alert else "No")
-    s2.metric("Organ Dysfunction (delta >= 2)", "Yes" if m_ews.organ_dysfunction_alert else "No")
+    s2.metric("Organ Dysfunction (Δ >= 2)", "Yes" if m_ews.organ_dysfunction_alert else "No")
     s3.metric("Suspected Infection", "Yes" if m_ews.suspected_infection else "No")
     if has_pn_label and pd.notna(stay_row["has_sepsis_label"]):
         pn_pos = bool(stay_row["has_sepsis_label"]) and (marker_hr >= float(stay_row["sepsis_onset_hour"]) - 1.0)
@@ -839,7 +863,7 @@ with tab_markers:
         st.write("Recorded infection context factors:", ", ".join(m_ews.infection_factors))
 
     # --- Marker-to-SOFA Impact at Hour t -----------------------------------
-    st.subheader(f"Markers & SOFA Impact at Hour {marker_hr:.0f}")
+    st.subheader(f"Markers & SOFA Impact at Hour {marker_hr}")
     total_pts = max(1, m_sofa.total)
 
     def _fmt(v, unit=""):
@@ -906,7 +930,7 @@ with tab_markers:
     st.dataframe(pd.DataFrame(impact_rows), use_container_width=True, hide_index=True)
 
     # --- Hourly Marker & SOFA Contribution Table (Hour 0..t) ---------------
-    st.subheader(f"Hour-by-Hour Markers & SOFA Contributions (Hours 0 to {eval_hr:.0f})")
+    st.subheader(f"Hour-by-Hour Markers & SOFA Contributions (Hours 0 to {eval_hr})")
     st.bar_chart(
         hourly_df.set_index("Hour")[
             ["Resp (pts)", "Coag (pts)", "Liver (pts)", "CV (pts)", "CNS (pts)", "Renal (pts)"]
@@ -1002,7 +1026,7 @@ with tab2:
         sc2.metric("APS III", str(aps3_sim.score) if aps3_sim.score is not None else "Unavailable", delta=aps3_sim.status)
         sc3.metric("Deterioration Signals", ews_sim.deterioration_count)
         st.write("Signals:", ews_sim.deterioration_signals)
-        st.write("Infection Context:", ews_sim.infection_window, ews_sim.infection_factors)
+        st.write("Infection Context:", _window_label(ews_sim.infection_window), ews_sim.infection_factors)
 
 # ===========================================================================
 # TAB 3: Model Accuracy
