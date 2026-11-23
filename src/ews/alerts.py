@@ -39,6 +39,33 @@ ELDERLY_AGE = 65.0          # years  # TODO: verify
 ICU_ACQUIRED_HOURS = 48.0   # >=48h -> ICU-acquired infection window  # TODO: verify
 SOFA_DELTA_ALERT = 2        # >=2 points above baseline (Sepsis-3)
 
+# Human-readable names for the machine tier keys. The keys themselves stay as
+# they are: they are asserted in tests and used to look up banner colours, so
+# only what reaches the reader changes.
+ALERT_TIER_LABELS = {
+    "none": "Low Risk",
+    "early_warning": "Early Warning",
+    "organ_dysfunction": "Organ Dysfunction",
+    "possible_sepsis": "Possible Sepsis",
+}
+
+# Baseline-vulnerability tiers, in the same three steps the scoring uses. Kept
+# as Low / Medium / High rather than "no risk": a patient with no recorded
+# flags still carries baseline sepsis risk, and the disclaimer promises
+# decision support, not reassurance.
+VULN_TIER_LABELS = {
+    "standard": "Low",
+    "elevated": "Medium",
+    "high": "High",
+}
+
+# Infection-window keys for display. The stored values keep their machine form
+# because the tests assert them, so only the rendered text goes through here.
+INFECTION_WINDOW_LABELS = {
+    "pre_existing_or_early (<48h)": "Pre-existing or Early (<48h)",
+    "icu_acquired_risk (>=48h)": "ICU-acquired (>=48h)",
+}
+
 
 @dataclass
 class EWSAssessment:
@@ -159,10 +186,10 @@ def evaluate_ews(
 
     if possible_sepsis:
         tier = "possible_sepsis"
-        risk_label = "Possible Sepsis Alert (SOFA delta >= 2 + suspected infection)"
+        risk_label = "Possible Sepsis Alert (SOFA Δ >= 2 + suspected infection)"
     elif organ_dysfunction:
         tier = "organ_dysfunction"
-        risk_label = "Organ Dysfunction Risk (SOFA delta >= 2; no confirmed infection flag)"
+        risk_label = "Organ Dysfunction Risk (SOFA Δ >= 2; no confirmed infection flag)"
     elif early_warning:
         tier = "early_warning"
         risk_label = "Early Warning Alert (Pre-SOFA physiological/lab deterioration)"
@@ -171,8 +198,11 @@ def evaluate_ews(
         risk_label = "Low / Routine Monitoring"
 
     summary = (
-        f"Tier={tier} | SOFA={sofa_total} (delta {sofa_delta:+d}) | "
-        f"Vulnerability={vuln_tier} | Signals={len(signals)} | Window={inf_window}"
+        f"Tier={ALERT_TIER_LABELS.get(tier, tier)} | "
+        f"SOFA={sofa_total} (Δ {sofa_delta:+d}) | "
+        f"Vulnerability={VULN_TIER_LABELS.get(vuln_tier, vuln_tier)} | "
+        f"Signals={len(signals)} | "
+        f"Window={INFECTION_WINDOW_LABELS.get(inf_window, inf_window)}"
     )
 
     return EWSAssessment(
