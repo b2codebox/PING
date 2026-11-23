@@ -38,25 +38,38 @@ st.set_page_config(
     layout="wide",
 )
 
+# Tier colours as (r, g, b) triples of the accent hue. The banner background is
+# that hue at low alpha, so it reads as a soft tint on the light theme and as a
+# deep tint on the dark one without a second palette per theme. A fixed pastel
+# would stay pale on dark and glare against it.
 ALERT_STYLES = {
-    "none": ("#e8f5e9", "#2e7d32", "#1b5e20", "LOW RISK"),
-    "early_warning": ("#fff8e1", "#f9a825", "#8d5500", "EARLY WARNING"),
-    "organ_dysfunction": ("#fff3e0", "#ef6c00", "#bf360c", "ORGAN DYSFUNCTION"),
-    "possible_sepsis": ("#ffebee", "#c62828", "#8e0000", "POSSIBLE SEPSIS"),
+    "none": ((34, 197, 94), "LOW RISK", (22, 122, 58)),
+    "early_warning": ((245, 158, 11), "EARLY WARNING", (160, 100, 0)),
+    "organ_dysfunction": ((249, 115, 22), "ORGAN DYSFUNCTION", (178, 74, 0)),
+    "possible_sepsis": ((239, 68, 68), "POSSIBLE SEPSIS", (190, 30, 30)),
 }
+
+# Warning hues are hard to read as text on a light background, so the label uses
+# a darker shade. On the dark theme the accent itself is legible and the darker
+# shade would be too dim, so the badge rule in the stylesheet switches back to
+# the accent colour when the operating system reports a dark theme.
 
 
 def render_alert_banner(tier: str, risk_label: str, summary: str) -> None:
-    bg, border, text, badge = ALERT_STYLES.get(tier, ALERT_STYLES["none"])
+    (r, g, b), badge, label_rgb = ALERT_STYLES.get(tier, ALERT_STYLES["none"])
+    lr, lg, lb = label_rgb
     st.markdown(
         f"""
-        <div style="background:{bg};border-left:6px solid {border};padding:14px 18px;
-                    border-radius:var(--ui-radius);margin:10px 0 16px 0;color:{text};">
-          <div style="font-size:12px;font-weight:700;letter-spacing:0.06em;margin-bottom:4px;">
+        <div style="background:rgba({r},{g},{b},0.14);border-left:6px solid rgb({r},{g},{b});
+                    padding:14px 18px;border-radius:var(--ui-radius);margin:10px 0 16px 0;
+                    --ui-alert-accent: rgb({r},{g},{b});">
+          <div class="ui-alert-badge"
+               style="font-size:12px;font-weight:700;letter-spacing:0.06em;
+                      margin-bottom:4px;color:rgb({lr},{lg},{lb});">
             {badge}
           </div>
           <div style="font-size:16px;font-weight:600;margin-bottom:4px;">{risk_label}</div>
-          <div style="font-size:13px;opacity:0.9;">{summary}</div>
+          <div style="font-size:13px;opacity:0.85;">{summary}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -66,8 +79,9 @@ def render_alert_banner(tier: str, risk_label: str, summary: str) -> None:
 def render_disclaimer() -> None:
     st.markdown(
         f"""
-        <div style="background:#f5f5f5;border:1px solid #bdbdbd;border-left:5px solid #424242;
-                    padding:10px 14px;border-radius:var(--ui-radius);margin:0 0 14px 0;color:#212121;
+        <div style="background:var(--ui-surface);border:1px solid var(--ui-surface-border);
+                    border-left:5px solid rgba(128, 128, 128, 0.75);
+                    padding:10px 14px;border-radius:var(--ui-radius);margin:0 0 14px 0;
                     font-size:13px;font-weight:600;">
           {DISCLAIMER}
         </div>
@@ -93,6 +107,30 @@ def inject_layout_css() -> None:
         */
         :root {
             --ui-radius: 8px;
+            /* Neutral tones for the hand-written HTML (cards, tab rule,
+               banner background). These are translucent greys rather than
+               fixed colours, so they land correctly on both the light and the
+               dark Streamlit background without needing to know which theme
+               is active. Streamlit exposes no theme colours as CSS variables
+               in this version, and the theme chosen in the top-right menu is
+               not reflected in prefers-color-scheme, so a fixed palette would
+               go wrong in one mode or the other. */
+            --ui-surface: rgba(128, 128, 128, 0.12);
+            --ui-surface-border: rgba(128, 128, 128, 0.34);
+            --ui-surface-text: inherit;
+            --ui-tab-rule: rgba(128, 128, 128, 0.28);
+            --ui-card-border: rgba(128, 128, 128, 0.28);
+        }
+
+        /* --- Alert badges ------------------------------------------------
+           The tier label sits on a tinted banner. Its inline colour is the
+           darker "readable on light" shade; when the system reports a dark
+           theme the brighter accent reads better, so switch back to it.
+        */
+        @media (prefers-color-scheme: dark) {
+            .ui-alert-badge {
+                color: var(--ui-alert-accent) !important;
+            }
         }
 
         /* --- Page frame ------------------------------------------------- */
@@ -127,7 +165,7 @@ def inject_layout_css() -> None:
         }
         .stTabs [data-baseweb="tab-list"] {
             gap: 1.75rem;
-            border-bottom: 1px solid #e6e6e6;
+            border-bottom: 1px solid var(--ui-tab-rule);
         }
         .stTabs [data-baseweb="tab"] {
             padding: 0.5rem 0 0.65rem 0;
@@ -169,7 +207,7 @@ def inject_layout_css() -> None:
         }
         .block-container [data-testid="stMetric"] {
             padding: 0.6rem 0.75rem;
-            border: 1px solid #e8e8e8;
+            border: 1px solid var(--ui-card-border);
             border-radius: var(--ui-radius);
         }
         .block-container [data-testid="stMetric"] label p {
@@ -758,22 +796,24 @@ with tab_markers:
     # --- Separate Category: Existing Sepsis Status -------------------------
     st.subheader("Existing Sepsis Status (<= t)")
     if m_ews.possible_sepsis_alert:
-        sepsis_bg, sepsis_border, sepsis_txt = "#ffebee", "#c62828", "#8e0000"
+        sepsis_accent = ALERT_STYLES["possible_sepsis"][0]
         sepsis_headline = "Existing Possible Sepsis Criteria Met (SOFA delta >= 2 + Suspected Infection)"
     elif m_ews.organ_dysfunction_alert:
-        sepsis_bg, sepsis_border, sepsis_txt = "#fff3e0", "#ef6c00", "#bf360c"
+        sepsis_accent = ALERT_STYLES["organ_dysfunction"][0]
         sepsis_headline = "Organ Dysfunction Present (SOFA delta >= 2), Without Confirmed Infection Flag"
     elif m_ews.suspected_infection:
-        sepsis_bg, sepsis_border, sepsis_txt = "#fff8e1", "#f9a825", "#8d5500"
+        sepsis_accent = ALERT_STYLES["early_warning"][0]
         sepsis_headline = "Suspected Infection Present, Below SOFA Delta >= 2 Threshold"
     else:
-        sepsis_bg, sepsis_border, sepsis_txt = "#e8f5e9", "#2e7d32", "#1b5e20"
+        sepsis_accent = ALERT_STYLES["none"][0]
         sepsis_headline = "No Existing Sepsis Criteria Met at Hour t"
 
+    sr, sg, sb = sepsis_accent
     st.markdown(
         f"""
-        <div style="background:{sepsis_bg};border-left:6px solid {sepsis_border};padding:12px 16px;
-                    border-radius:var(--ui-radius);margin:6px 0 14px 0;color:{sepsis_txt};">
+        <div style="background:rgba({sr},{sg},{sb},0.14);border-left:6px solid rgb({sr},{sg},{sb});
+                    padding:12px 16px;
+                    border-radius:var(--ui-radius);margin:6px 0 14px 0;">
           <div style="font-size:15px;font-weight:600;">{sepsis_headline}</div>
           <div style="font-size:13px;margin-top:4px;">
             Infection Window: <b>{m_ews.infection_window}</b> |
